@@ -1,12 +1,11 @@
-"""IP / 域名 → 资产归属（ip138 在线查询）。
+"""IP / 域名 → 资产归属。
 
-写报告时把目标反查成单位名 + 归属证明（Issue #53）。纯真离线库已过时，
-改为查 https://www.ip138.com/iplookup.php?ip=…&action=2 。
+写报告时把目标反查成单位名 + 归属证明（Issue #53）。优先使用镜像内置的
+仅查询 https://www.ip138.com/iplookup.php?ip=…&action=2 。
 
 - 只查 IPv4；IPv6 直接无归属。
-- 结果按 IP 缓存在内存：同一地址不重复打 ip138。
-- 查询失败不缓存，下次还能自愈。
-- `school_name_no_dns` / peek 只读缓存，绝不在列表接口里同步打网。
+- 在线结果按 IP 缓存，详情页和列表后台预热不重复查询。
+- school_name_no_dns / peek 只读 ip138 内存缓存，绝不在列表接口里同步打网。
 - 失败一律返回 None，不影响主流程。
 """
 from __future__ import annotations
@@ -30,8 +29,12 @@ _HTTP_TIMEOUT = 8.0
 
 _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
+_negative_cache: dict[str, float] = {}
+_inflight: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
 _rate_lock = threading.Lock()
 _last_fetch_at = 0.0
+_NEGATIVE_CACHE_TTL = float(os.environ.get("AUTOHUNTER_OWNER_NEGATIVE_TTL", "900"))
 
 _JUNK_RE = re.compile(r"html\.join|function\s*\(|^\s*'\+")
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -176,7 +179,25 @@ def _cache_put(ip: str, info: dict) -> None:
 def cache_clear() -> None:
     with _cache_lock:
         _cache.clear()
+        _negative_cache.clear()
     _resolve_host.cache_clear()
+
+
+def _negative_cache_hit(ip: str) -> bool:
+    now = time.monotonic()
+    with _cache_lock:
+        expires_at = _negative_cache.get(ip)
+        if expires_at is None:
+            return False
+        if expires_at <= now:
+            _negative_cache.pop(ip, None)
+            return False
+        return True
+
+
+def _negative_cache_put(ip: str) -> None:
+    with _cache_lock:
+        _negative_cache[ip] = time.monotonic() + max(0.0, _NEGATIVE_CACHE_TTL)
 
 
 def _rate_limit() -> None:
@@ -218,7 +239,11 @@ def source_url(ip: str) -> str:
 
 
 def _lookup_ip(ip: str) -> dict | None:
-    """查单个 IPv4。命中缓存直接返回；失败不写缓存。"""
+    """查单个 IPv4。
+
+    成功结果长期缓存在进程内；失败结果只缓存一小段时间，避免 ip138 不可用时
+    每次打开详情都重复打满超时。并发请求同一 IP 时只允许一个线程真正访问外网。
+    """
     try:
         ip_obj = ipaddress.ip_address(ip)
     except ValueError:
@@ -228,16 +253,37 @@ def _lookup_ip(ip: str) -> dict | None:
     cached = _cache_get(ip)
     if cached is not None:
         return cached or None
-    raw = _fetch_ip138(ip)
-    if raw is None:
+    if _negative_cache_hit(ip):
         return None
-    info = _info_from_raw(ip, raw)
-    _cache_put(ip, info)
-    return info
+
+    with _inflight_lock:
+        event = _inflight.get(ip)
+        if event is None:
+            event = threading.Event()
+            _inflight[ip] = event
+            leader = True
+        else:
+            leader = False
+    if not leader:
+        event.wait(timeout=_HTTP_TIMEOUT + 2.0)
+        return _cache_get(ip)
+
+    try:
+        raw = _fetch_ip138(ip)
+        if raw is None:
+            _negative_cache_put(ip)
+            return None
+        info = _info_from_raw(ip, raw)
+        _cache_put(ip, info)
+        return info
+    finally:
+        with _inflight_lock:
+            _inflight.pop(ip, None)
+            event.set()
 
 
 def peek_cached(target: str) -> dict | None:
-    """只读缓存：目标本身是 IPv4 且查过才返回。不做 DNS、不打网。"""
+    """只读 ip138 内存缓存：目标本身是 IPv4 时返回。不做 DNS、不打网。"""
     host = _host_from_target(target)
     if not host or not _is_ip(host):
         return None
@@ -292,6 +338,6 @@ async def lookup_school_async(target: str, timeout: float = 8.0) -> dict | None:
 
 
 def school_name_no_dns(target: str) -> str | None:
-    """仅当目标是已缓存的 IPv4 时返回单位名。列表接口用，零阻塞。"""
+    """只读 ip138 内存缓存，不做 DNS、不打网，列表接口可安全调用。"""
     info = peek_cached(target)
     return (info or {}).get("school") or None

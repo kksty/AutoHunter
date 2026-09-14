@@ -46,6 +46,9 @@ _ASSISTANT_STATIC_PREFIX = (
 )
 _ASSISTANT_SEVERITIES = ("严重", "高危", "中危", "低危")
 
+_OWNER_WARM_TASKS: set[asyncio.Task] = set()
+_OWNER_WARM_CONCURRENCY = max(1, int(os.environ.get("OWNER_WARM_CONCURRENCY", "3")))
+
 
 def _consume_future_exception(fut) -> None:
     try:
@@ -117,11 +120,9 @@ async def _paginated_finding_list(session, q, search, compact, limit, offset, *,
             out = out[offset:offset + limit + 1]
     if limit:
         page = out[:limit]
-        if not compact:
-            await _enrich_findings_owner(page)
+        _schedule_owner_warm(page)
         return {"items": page, "has_more": len(out) > limit, "limit": limit, "offset": offset}
-    if not compact:
-        await _enrich_findings_owner(out)
+    _schedule_owner_warm(out)
     return out
 
 
@@ -180,7 +181,7 @@ def _finding_dict(f: Finding, r: Review | None, *, compact: bool = False) -> dic
         if (f.assistant_messages or [])
         else _default_assistant_messages(),
         "self_check": f.self_check,
-        # 写报告用的高校归属：列表先读缓存（零阻塞）。详情/全字段列表再查 ip138。
+        # 写报告用的高校归属：列表只读 ip138 缓存（零网络阻塞），详情/后台预热按需查询。
         "edu_school": _edu_school_fast(f.target_url),
         "owner_proof": _owner_proof_fast(f.target_url),
     })
@@ -188,7 +189,7 @@ def _finding_dict(f: Finding, r: Review | None, *, compact: bool = False) -> dic
 
 
 def _edu_school_fast(target_url: str | None) -> str | None:
-    """零阻塞归属：只读 ip138 缓存，不打网、不解析域名。"""
+    """零阻塞归属：只读 ip138 内存缓存，不打网、不解析域名。"""
     if not target_url:
         return None
     try:
@@ -229,22 +230,31 @@ async def _resolve_edu_school_async(target_url: str | None) -> dict | None:
         return None
 
 
-async def _enrich_findings_owner(items: list[dict]) -> None:
-    """全字段列表补归属证明：已缓存的秒回，未命中的并发查 ip138（有频率限制）。"""
+
+async def _warm_owner_cache(items: list[dict]) -> None:
     pending = [
         d for d in items
         if d.get("target_url") and not d.get("owner_proof")
     ]
     if not pending:
         return
-    sem = asyncio.Semaphore(3)
+    sem = asyncio.Semaphore(_OWNER_WARM_CONCURRENCY)
 
     async def one(d: dict) -> None:
         async with sem:
-            _apply_owner_info(d, await _resolve_edu_school_async(d.get("target_url")))
+            # 结果写入 edu_ip 的服务端内存缓存；列表响应不等待这里。
+            await _resolve_edu_school_async(d.get("target_url"))
 
-    await asyncio.gather(*(one(d) for d in pending))
+    await asyncio.gather(*(one(d) for d in pending), return_exceptions=True)
 
+
+def _schedule_owner_warm(items: list[dict]) -> None:
+    pending = [d for d in items if d.get("target_url") and not d.get("owner_proof")]
+    if not pending:
+        return
+    task = asyncio.create_task(_warm_owner_cache(pending))
+    _OWNER_WARM_TASKS.add(task)
+    task.add_done_callback(_OWNER_WARM_TASKS.discard)
 
 @router.get("/tasks/{task_id}/findings")
 async def list_findings(task_id: str, status: Optional[str] = None,
@@ -1381,3 +1391,4 @@ async def user_deepen(finding_id: str, req: DeepenRequest,
         r.user_reviewed_at = _now()
     await session.commit()
     return {"ok": True, "message": suffix.strip(" →")}
+

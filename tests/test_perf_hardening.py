@@ -79,13 +79,42 @@ def test_lookup_ip_is_cached(monkeypatch):
 
 
 def test_lookup_ip_transient_fetch_fail_not_cached(monkeypatch):
-    """ip138 瞬时失败返回的 None 不能被缓存，否则恢复后该 IP 永久查不到。"""
+    """ip138 失败只短暂缓存，避免详情接口每次都重复等待超时。"""
     from app.tools import edu_ip
 
     edu_ip.cache_clear()
-    monkeypatch.setattr(edu_ip, "_fetch_ip138", lambda ip: None)
+    calls = {"n": 0}
+
+    def fail_once(ip):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(edu_ip, "_fetch_ip138", fail_once)
     assert edu_ip._lookup_ip("202.115.32.1") is None
     assert edu_ip.peek_cached("202.115.32.1") is None, "失败结果绝不写入缓存"
+    assert edu_ip._lookup_ip("202.115.32.1") is None
+    assert calls["n"] == 1, "失败结果应在短 TTL 内命中负缓存"
+
+
+def test_lookup_ip_same_uncached_ip_is_coalesced(monkeypatch):
+    """并发详情请求同一 IP 时只发一个 ip138 请求。"""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from app.tools import edu_ip
+
+    edu_ip.cache_clear()
+    calls = {"n": 0}
+
+    def fake_fetch(ip):
+        calls["n"] += 1
+        time.sleep(0.02)
+        return {"location": "中国 四川省 成都市", "isp": "教育网", "tag": "四川大学", "ip_type": ""}
+
+    monkeypatch.setattr(edu_ip, "_fetch_ip138", fake_fetch)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: edu_ip._lookup_ip("202.115.32.1"), range(6)))
+    assert all(item and item["school"] == "四川大学" for item in results)
+    assert calls["n"] == 1
 
 
 # ---------- #3 executor 持久 http client ----------
@@ -213,3 +242,4 @@ class FindingsPaginationTest(unittest.IsolatedAsyncioTestCase):
             out = await fa.user_review_queue(self.tid, search="needlehaystack",
                                              compact=False, limit=0, offset=0, session=s)
         self.assertEqual(len(out), 3)  # 默认非 compact，搜索仍能命中 raw_request 内容
+
